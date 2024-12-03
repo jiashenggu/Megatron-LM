@@ -4,7 +4,7 @@ import webdataset as wds
 
 from tqdm import tqdm
 
-llava_pretrain_dir = '<path_to_LLaVA-Pretrain>'
+llava_pretrain_dir = '/gpfs/public/vl/gjs/dataset/LLaVA-Pretrain'
 
 # Paths to the dataset files
 json_file = os.path.join(llava_pretrain_dir, 'blip_laion_cc_sbu_558k.json')

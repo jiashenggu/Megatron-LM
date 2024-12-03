@@ -408,17 +408,18 @@ The HF checkpoints can be converted to Megatron format by using Megatron's own M
 Using the path to the Mistral tokenizer model (downloaded alongside the HF checkpoint), run the following command from the root of your Megatron source code to convert from HF format to mcore format:
 
 ```
-$>: python tools/checkpoint/convert.py \
- >    --bf16 \
- >    --model-type GPT \
- >    --loader llama_mistral \
- >    --saver mcore \
- >    --target-tensor-parallel-size ${TP} \
- >    --checkpoint-type hf \
- >    --load-dir ${HF_FORMAT_DIR} \
- >    --save-dir ${MEGATRON_FORMAT_DIR} \
- >    --tokenizer-model ${TOKENIZER_MODEL} \
- >    --model-size mistral-7B \
+export TP=2
+python tools/checkpoint/convert.py \
+  --bf16 \
+  --model-type GPT \
+  --loader llama_mistral \
+  --saver mcore \
+  --target-tensor-parallel-size ${TP} \
+  --checkpoint-type hf \
+  --load-dir /gpfs/public/vl/gjs/model/Mistral-7B-Instruct-v0.3 \
+  --save-dir /gpfs/public/vl/gjs/model/Mistral-7B-Instruct-v0.3-tp-${TP} \
+  --tokenizer-model /gpfs/public/vl/gjs/model/Mistral-7B-Instruct-v0.3 \
+  --model-size mistral-7B
 ```
 
 Valid values for `--model-size` are mistral-7B for the pretrained model or mistral-7Bf for the chat fine-tuned model.

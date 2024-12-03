@@ -4,6 +4,10 @@
 export NCCL_IB_SL=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 MODEL_NAME="mcore-llava-mistral-7b-instruct-clip336-pretraining"
+WORKSPACE="/gpfs/public/vl/gjs/Megatron-LM"
+LOAD_NAME="/gpfs/public/vl/gjs/model/mistral_vl"
+TOKENIZER_MODEL="/gpfs/public/vl/gjs/model/Mistral-7B-Instruct-v0.3"
+export OMP_NUM_THREADS=16
 
 # Check that the user has set an output path for model checkpoints.
 if [[ -z $WORKSPACE ]]; then
@@ -29,11 +33,12 @@ if [[ -z $TOKENIZER_MODEL ]]; then
     exit 1
 fi
 
-CHECKPOINT_DIR="${WORKSPACE}/${LOAD_NAME}/checkpoints"
+# CHECKPOINT_DIR="${WORKSPACE}/${LOAD_NAME}/checkpoints"
+CHECKPOINT_DIR="${LOAD_NAME}"
 
 DATA_TRAIN="${SOURCE}/examples/multimodal/pretrain_dataset.yaml"
 
-DEBUG=0
+DEBUG=1
 if [[ $DEBUG -eq 1 ]]; then
     BZ=32
     NW=2
@@ -72,7 +77,7 @@ OPTIONS=" \
     --swiglu \
     --attention-dropout 0.0 \
     --hidden-dropout ${HD} \
-    --tensor-model-parallel-size 4 \
+    --tensor-model-parallel-size 2 \
     --pipeline-model-parallel-size 1 \
     --num-layers 32 \
     --hidden-size 4096 \
@@ -93,7 +98,7 @@ OPTIONS=" \
     --eval-iters 10 \
     --eval-interval 1000 \
     --tokenizer-type MultimodalTokenizer \
-    --tokenizer-model ${WORKSPACE}/${TOKENIZER_MODEL} \
+    --tokenizer-model ${TOKENIZER_MODEL} \
     --tokenizer-prompt-format mistral \
     --data-path ${DATA_TRAIN} \
     --prompt-path ${SOURCE}/examples/multimodal/manual_prompts.json \
@@ -130,4 +135,4 @@ OPTIONS=" \
 export NVTE_APPLY_QK_LAYER_SCALING=0
 export NVTE_ALLOW_NONDETERMINISTIC_ALGO=${NONDETERMINISTIC_ATTN}
 
-torchrun --nproc_per_node 8 examples/multimodal/train.py ${OPTIONS}
+torchrun --nproc_per_node 2 examples/multimodal/train.py ${OPTIONS}
