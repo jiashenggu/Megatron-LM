@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.transformer.transformer_block import TransformerBlock
-    from megatron.core.inference_params import InferenceParams
+    from megatron.core.inference.contexts import BaseInferenceContext
     from megatron.core.packed_seq_params import PackedSeqParams
 
 import logging
@@ -25,6 +25,7 @@ from megatron.core.models.common.embeddings.rope_utils import (  # for backward 
     apply_rotary_pos_emb,
     get_pos_emb_on_this_cp_rank,
 )
+from megatron.core.utils import deprecate_inference_params
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,8 @@ class RotaryEmbedding(nn.Module):
             for longer sequences. The value must be a float larger than 1.0. Defaults to None
         rotary_base (int, optional): Base period for rotary position embeddings. Defaults to
             10000.
-        rope_scaling (bool, optional): Apply rope scaling as used in llama 3.1
+        rope_scaling (bool, optional): Apply rope scaling as used in llama 3.x.
+        rope_scaling_factor (float, optional): rope scaling factor in llama 3.x. Defaults to 8.
         use_cpu_initialization (bool, optional): If False, initialize the inv_freq directly
             on the GPU. Defaults to False
     """
@@ -59,6 +61,7 @@ class RotaryEmbedding(nn.Module):
         seq_len_interpolation_factor: float = None,
         rotary_base: int = 10000,
         rope_scaling: bool = False,
+        rope_scaling_factor: float = 8.0,
         use_cpu_initialization: bool = False,
     ) -> None:
         super().__init__()
@@ -75,7 +78,7 @@ class RotaryEmbedding(nn.Module):
         )
 
         if rope_scaling:
-            self.inv_freq = self._apply_scaling(self.inv_freq)
+            self.inv_freq = self._apply_scaling(self.inv_freq, factor=rope_scaling_factor)
 
     def _apply_scaling(
         self,
@@ -174,16 +177,18 @@ class RotaryEmbedding(nn.Module):
 
     def get_rotary_seq_len(
         self,
-        inference_params: InferenceParams,
+        inference_context: BaseInferenceContext,
         transformer: TransformerBlock,
         transformer_input: Tensor,
         transformer_config: TransformerConfig,
         packed_seq_params: PackedSeqParams,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ) -> float:
         """Function to get the rotary sequence length.
 
         Args:
-            inference_params : Used during Inference time
+            inference_context : Used during Inference time
             transformer (TransformerBlock): The transformer block (decoder/encoder) used
                 by the model
             transformer_input (Tensor): Input tensor to the transformer
@@ -193,14 +198,17 @@ class RotaryEmbedding(nn.Module):
         Returns:
             float: The rotary sequence length
         """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
         if packed_seq_params is not None:
             # max_seqlen are the max sequence length in the packed sequence before being divived
             # by the tp and cp size.
             return max(packed_seq_params.max_seqlen_q, packed_seq_params.max_seqlen_kv)
-        elif inference_params is not None:
-            rotary_seq_len = inference_params.max_sequence_length
+        elif inference_context is not None:
+            rotary_seq_len = inference_context.max_sequence_length
         else:
-            if transformer.input_tensor is not None:
+            if transformer is not None and transformer.input_tensor is not None:
                 rotary_seq_len = transformer.input_tensor.size(0)
             else:
                 rotary_seq_len = transformer_input.size(0)

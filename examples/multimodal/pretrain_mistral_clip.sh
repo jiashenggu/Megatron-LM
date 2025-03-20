@@ -28,13 +28,7 @@ if [[ -z $LOAD_NAME ]]; then
     exit 1
 fi
 
-if [[ -z $TOKENIZER_MODEL ]]; then
-    echo "Please set TOKENIZER_MODEL for tokenizer model name."
-    exit 1
-fi
-
-# CHECKPOINT_DIR="${WORKSPACE}/${LOAD_NAME}/checkpoints"
-CHECKPOINT_DIR="${LOAD_NAME}"
+CHECKPOINT_DIR="${WORKSPACE}/${LOAD_NAME}/checkpoints"
 
 DATA_TRAIN="${SOURCE}/examples/multimodal/pretrain_dataset.yaml"
 

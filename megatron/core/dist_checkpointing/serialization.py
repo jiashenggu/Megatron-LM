@@ -25,7 +25,7 @@ from .mapping import (
     StateDict,
     apply_factory_merges,
 )
-from .state_dict_transformation import load_preprocess, save_preprocess
+from .state_dict_utils import load_preprocess, save_preprocess
 from .strategies.async_utils import AsyncRequest
 from .strategies.base import (
     AsyncSaveShardedStrategy,
@@ -104,8 +104,6 @@ def load(
 
     checkpoint_dir = Path(checkpoint_dir)
     common_state_dict = common_strategy.load_common(checkpoint_dir)
-    if not sharded_state_dict:
-        return common_state_dict
 
     sharded_state_dict, nonpersistent_state_dict, sh_ten_factories = load_preprocess(
         sharded_state_dict
@@ -353,9 +351,10 @@ def save(
             )
 
         if next(checkpoint_dir.iterdir(), None) is not None:
-            raise CheckpointingException(
-                f'Checkpoint destination directory ({checkpoint_dir}) is not empty'
-            )
+            # Don't throw exception here since this could cause a cascade of failures
+            # without human intervention in cases where multiple jobs are queued up.
+            if torch.distributed.get_rank() == 0:
+                logger.warning("Overwriting old incomplete / corrupted checkpoint...")
 
     if common_strategy is not None:
         raise NotImplementedError('The only supported common strategy is torch')

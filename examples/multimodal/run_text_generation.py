@@ -14,15 +14,29 @@ sys.path.append(
 import torch
 import yaml
 from config import EvaluationConfig
-from evaluation_datasets import get_evaluation_dataset
+from evaluation.evaluation_datasets import get_evaluation_dataset
 from model import model_provider
 from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import parallel_state
+from megatron.core.enums import ModelType
+from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.inference.text_generation.api import generate_and_post_process
 from megatron.inference.text_generation.forward_step import ForwardStep
 from megatron.inference.text_generation.communication import broadcast_int_list
+from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.engines import StaticInferenceEngine
+from megatron.core.inference.inference_request import InferenceRequest, VLMInferenceRequest
+from megatron.core.inference.text_generation_controllers.vlm_text_generation_controller import (
+    VLMTextGenerationController,
+)
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
+from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
+    VLMInferenceWrapper,
+)
 from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
@@ -36,7 +50,7 @@ def add_text_generation_args(parser):
     group.add_argument("--top_p", type=float, default=0.0, help='Top p sampling.')
     group.add_argument("--top_k", type=int, default=0, help='Top k sampling.')
     group.add_argument(
-        "--out-seq-length", type=int, default=1024, help='Length of the output generated text.'
+        "--out-seq-length", type=int, default=128, help='Length of the output generated text.'
     )
     group.add_argument("--output-path", type=str, help='Output file path')
     group.add_argument('--input-image-path', type=str, help="Input image directory")
@@ -56,8 +70,12 @@ def add_text_generation_args(parser):
             "MMMU",
             "VideoMME",
             "OCRBench",
+            "OCRBench_v2",
             "MathVista",
             "AI2D",
+            "InfoVQA",
+            "SPDocVQA",
+            "RD_TableBench",
         ],
         help="Generation task to run",
     )
@@ -65,6 +83,8 @@ def add_text_generation_args(parser):
         "--num-samples-per-partition", type=int, default=0, help="Number of samples per partition"
     )
     group.add_argument("--config-path", type=str, help="Evaluation config file to use.")
+
+    group.add_argument("--use-mcore-inference", action="store_true", default=False, help="Use the MCore inference API")
 
     # Add common multimodal arguments needed for e.g. building the model.
     parser = add_multimodal_extra_args(parser)
@@ -151,16 +171,62 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         args.use_tile_tags,
     )
 
+    if args.use_mcore_inference:
+        inference_wrapper_config = InferenceWrapperConfig(
+            hidden_size=args.hidden_size,
+            inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
+            fp32_residual_connection=args.fp32_residual_connection,
+            params_dtype=args.params_dtype,
+            padded_vocab_size=args.padded_vocab_size,
+        )
+        inference_wrapped_model = VLMInferenceWrapper(model, inference_wrapper_config)
+        tokenizer = get_tokenizer()
+        controller = VLMTextGenerationController(
+            inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
+        )
+        inference_engine = StaticInferenceEngine(
+            controller, max_batch_size=1, random_seed=args.seed
+        )
+        sampling_params = SamplingParams(
+            temperature=config.temperature,
+            top_k=config.top_k,
+            top_p=config.top_p,
+            num_tokens_to_generate=config.out_seq_length,
+        )
+
     for idx, (imgs, num_tiles, sample_id, question, answers, metadata) in enumerate(dataloader):
         imgs = imgs.to("cuda")
         num_tiles = num_tiles.to("cuda")
 
         conv = get_conversation(config.task, question)
 
-        forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles, args.decoder_seq_length)
+        if not args.use_mcore_inference:
+            forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles, args.decoder_seq_length)
+
 
         if is_first_rank():
-            resp_sentences, _, _, _ = generate_and_post_process(
+
+            if args.use_mcore_inference:
+                inference_request = VLMInferenceRequest(
+                   request_id=inference_engine.get_new_request_id(),
+                   prompt=conv,
+                   prompt_tokens=controller.tokenize_prompt(conv),
+                   sampling_params=sampling_params,
+                   num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+                   imgs=imgs,
+                   num_tiles=num_tiles,
+                   decoder_seq_length=args.decoder_seq_length,
+                )
+                results: List[InferenceRequest] = inference_engine.generate(
+                    inference_requests=[inference_request]
+                )
+
+                resp_sentences = [
+                    tokenizer.detokenize(result.prompt_tokens) + result.generated_text
+                    for result in results
+                ]
+            else:
+                resp_sentences, _, _, _ = generate_and_post_process(
                 model,
                 forward_step=forward_step,
                 prompts=[conv],
@@ -190,6 +256,8 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     "OCRBench",
                     "MathVista",
                     "AI2D",
+                    "InfoVQA",
+                    "SPDocVQA",
                 ):
                     output_name = "answer"
                 elif config.task in ("MMMU"):
@@ -197,6 +265,8 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 elif config.task == "VideoMME":
                     output_name = "response"
                     output = question
+                elif config.task in ["OCRBench_v2", "RD_TableBench"]:
+                    output_name = "predict"
                 else:
                     raise NotImplementedError("no output name defined for", config.task)
 
@@ -206,18 +276,21 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 if config.task == "VideoMME":
                     output["questions"][0][output_name] = generated
                 else:
-                    output[output_name] = generated
                     output["prompt"] = prompt
+                    output[output_name] = generated
 
-                if config.task == "captioning":
+                if config.task in ["captioning", "RD_TableBench"]:
                     output["ground_truth"] = answers
                 elif config.task in (
                     "TextVQA",
                     "VQAv2",
                     "ChartQA",
                     "OCRBench",
+                    "OCRBench_v2",
                     "MathVista",
                     "AI2D",
+                    "InfoVQA",
+                    "SPDocVQA",
                 ):
                     if isinstance(answers, str):
                         answers = [answers]
@@ -237,9 +310,24 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 yield output
                 idx += 1
         else:
-            generate_and_post_process(
-                model, forward_step=forward_step, detokenize_segments=False, data_parallel=True
-            )
+            if args.use_mcore_inference:
+                inference_request = VLMInferenceRequest(
+                   request_id=inference_engine.get_new_request_id(),
+                   prompt=conv,
+                   prompt_tokens=controller.tokenize_prompt(conv),
+                   sampling_params=sampling_params,
+                   num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+                   imgs=imgs,
+                   num_tiles=num_tiles,
+                   decoder_seq_length=args.decoder_seq_length,
+                )
+                inference_engine.generate(
+                    inference_requests=[inference_request]
+                )
+            else:
+                generate_and_post_process(
+                    model, forward_step=forward_step, detokenize_segments=False, data_parallel=True
+                )
 
             idx += 1
 
@@ -308,7 +396,6 @@ def generate_and_write_samples(model, config, print_output=True):
     if is_first_rank():
         output_file.close()
 
-
 class VLMForwardStep(ForwardStep):
     """Inference forward step for a multimodal model."""
 
@@ -348,13 +435,13 @@ class VLMForwardStep(ForwardStep):
             tokens,
             position_ids,
             attention_mask=None,
-            inference_params=self.inference_params,
+            inference_context=self.inference_context,
             num_image_tiles=self._num_tiles,
             runtime_gather_output=True,
         )
 
     def __call__(self, tokens, position_ids, attention_mask):
-        num_image_tokens = (tokens == self.model.image_token_index).sum().item()
+        num_image_tokens = (tokens == self.model.module.image_token_index).sum().item()
         num_tokens = tokens.size(1)
         recv_buffer_seq_length = None
         if num_image_tokens > 0:
@@ -383,14 +470,14 @@ class VLMForwardStep(ForwardStep):
         # On every PP stage(although inference params should only matter for decoder),
         # update the sequence length offset by the number of image tokens.
         if num_tokens > 1 and num_image_tokens > 0:
-            if "image_tokens_count" not in self.inference_params.key_value_memory_dict:
-                self.inference_params.key_value_memory_dict["image_tokens_count"] = self._num_img_embeddings
+            if "image_tokens_count" not in self.inference_context.key_value_memory_dict:
+                self.inference_context.key_value_memory_dict["image_tokens_count"] = self._num_img_embeddings
 
             if self._num_img_embeddings + num_tokens - num_image_tokens > self.decoder_seq_length:
-                self.inference_params.sequence_len_offset += self.decoder_seq_length - num_tokens
+                self.inference_context.sequence_len_offset += self.decoder_seq_length - num_tokens
             else:
-                self.inference_params.sequence_len_offset += (
-                    self.inference_params.key_value_memory_dict["image_tokens_count"] - num_image_tokens
+                self.inference_context.sequence_len_offset += (
+                    self.inference_context.key_value_memory_dict["image_tokens_count"] - num_image_tokens
                 )
 
         return logits
@@ -406,21 +493,21 @@ def get_conversation(task, question):
             {"role": "system", "content": "Answer the questions."},
             {
                 "role": "user",
-                "content": "<image>\nProvide a one-sentence caption for provided image.",
+                "content": f"{IMAGE_TOKEN}\nProvide a one-sentence caption for provided image.",
             },
         ]
-    elif task in ("TextVQA", "VQAv2", "ChartQA"):
+    elif task in ("TextVQA", "VQAv2", "ChartQA", "InfoVQA", "SPDocVQA"):
         conversation = [
             {"role": "system", "content": "Answer the questions."},
             {
                 "role": "user",
-                "content": f"<image>\n{question}\nAnswer the question using a single word or phrase.",
+                "content": f"{IMAGE_TOKEN}\n{question}\nAnswer the question using a single word or phrase.",
             },
         ]
-    elif task in ("OCRBench", "MathVista", "AI2D"):
+    elif task in ("OCRBench", "OCRBench_v2", "MathVista", "AI2D", "RD_TableBench"):
         conversation = [
             {"role": "system", "content": "Answer the questions."},
-            {"role": "user", "content": f"<image>\n{question}"},
+            {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
         ]
     elif task == "MMMU":
         conversation = [
@@ -441,7 +528,7 @@ def get_conversation(task, question):
 
         conversation = [
             {"role": "system", "content": "Answer the questions."},
-            {"role": "user", "content": f"<image>\n{question}"},
+            {"role": "user", "content": f"{IMAGE_TOKEN}\n{q}"},
         ]
 
     return conversation
@@ -449,7 +536,7 @@ def get_conversation(task, question):
 
 def get_prompt_and_generated(prompt_and_generation, prompt_format):
     """Strip prompt and other unnecessary text from generation."""
-    if prompt_format == "llama3":
+    if prompt_format in ("llama3", "llama3p1"):
         splitted = prompt_and_generation.split("<|start_header_id|>assistant<|end_header_id|>\n\n")
         prompt = splitted[0]
         generated = splitted[1]
@@ -464,16 +551,16 @@ def get_prompt_and_generated(prompt_and_generation, prompt_format):
         prompt = splitted[0]
         generated = splitted[1]
         generated = generated.split("<|im_end|>")[0]
-    elif prompt_format in ("nvlm-yi-34b", "qwen2p0"):
+    elif prompt_format in ("nvlm-yi-34b", "qwen2p0", "qwen2p5"):
         splitted = prompt_and_generation.split("<|im_start|>assistant\n")
         prompt = splitted[0]
         generated = splitted[1]
         generated = generated.split("<|im_end|>")[0]
+    else:
+        raise ValueError(f"Prompt format {prompt_format} is not supported.")
 
     # Remove possible garbage.
     generated = generated.strip()
-    generated = generated.split("\n\n")[0]
-    generated = generated.split("\n")[0]
 
     return prompt, generated
 
@@ -489,11 +576,11 @@ def main():
 
     args = get_args()
 
-    def wrapped_model_provider(pre_process, post_process):
-        return model_provider(pre_process, post_process, parallel_output=False)
+    def wrapped_model_provider(pre_process, post_process, add_encoder, add_decoder):
+        return model_provider(pre_process, post_process, add_encoder, add_decoder, parallel_output=False)
 
     # Set up model and load checkpoint.
-    model = get_model(wrapped_model_provider, wrap_with_ddp=False)
+    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_and_decoder, wrap_with_ddp=False)
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None)
