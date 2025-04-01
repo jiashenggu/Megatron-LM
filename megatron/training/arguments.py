@@ -29,10 +29,8 @@ from megatron.training.activations import squared_relu
 from megatron.training.utils import update_use_dist_ckpt, get_device_arch_version
 
 
-def parse_args(extra_args_provider=None, ignore_unknown_args=False):
-    """Parse all arguments."""
-    parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
-                                     allow_abbrev=False)
+def add_megatron_arguments(parser: argparse.ArgumentParser):
+    """"Add Megatron-LM arguments to the given parser."""
 
     # Standard arguments.
     parser = _add_network_size_args(parser)
@@ -62,6 +60,15 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_ft_package_args(parser)
     parser = _add_config_logger_args(parser)
     parser = _add_rerun_machine_args(parser)
+
+    return parser
+
+def parse_args(extra_args_provider=None, ignore_unknown_args=False):
+    """Parse all arguments."""
+    parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
+                                     allow_abbrev=False)
+
+    parser = add_megatron_arguments(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -738,6 +745,11 @@ def validate_args(args, defaults={}):
             args.transformer_impl == "transformer_engine"
         ), 'Local transformer implementation currently does not support attention bias-based position embeddings.'
 
+    # MultiModal rotary embeddings arguments
+    if args.position_embedding_type == "mrope":
+        assert args.mrope_section is not None, \
+            '--mrope-section should be set when using --position-embedding-type mrope.'
+
     # MoE Spec check
     if args.num_experts == 0:
         args.num_experts = None
@@ -871,6 +883,14 @@ def validate_args(args, defaults={}):
         print("Warning: --replication-jump was specified despite not using replication. Ignoring.")
         args.replication_jump = None
 
+    if args.mtp_num_layers:
+        assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
+        assert args.context_parallel_size == 1, "Multi-Token Prediction (MTP) is not supported with Context Parallelism."
+        assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
+            f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
+            + f"The supported position embedding types are rope and none."
+        )
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -953,6 +973,12 @@ def _add_transformer_engine_args(parser):
                        choices=['e4m3', 'hybrid'],
                        help='Which fp8 format scheme to use for FP8 tensors in the forward and backward pass',
                        dest='fp8')
+    # per tensor current scaling recipe selection
+    group.add_argument('--fp8-recipe', default='delayed',
+                       choices=['tensorwise', 'delayed', 'mxfp8'],
+                       help='Which fp8 recipe to use for FP8 tensors in the forward and backward pass',
+                       dest='fp8_recipe')
+    # delayed scaling only configs
     group.add_argument('--fp8-margin', type=int, default=0,
                        help='Scaling margin for fp8',
                        dest='fp8_margin')
@@ -976,7 +1002,11 @@ def _add_transformer_engine_args(parser):
                        help='Keep the compute param in fp8 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp8.')
     group.add_argument('--first-last-layers-bf16', action='store_true',
-                       help='Construct the first and last layers in bf16.')
+                       help='Construct first and last layers in bf16 when doing FP8 training.')
+    group.add_argument('--num-layers-at-start-in-bf16', type=int, default=1,
+                       help='Number of layers at start to construct in bf16 when --first-last-layers-bf16 is enabled.')
+    group.add_argument('--num-layers-at-end-in-bf16', type=int, default=1,
+                       help='Number of layers at end to construct in bf16 when --first-last-layers-bf16 is enabled.')
     group.add_argument('--te-rng-tracker', action='store_true', default=False,
                        help='Use the Transformer Engine version of the random number generator. '
                             'Required for CUDA graphs support.')
@@ -1138,7 +1168,7 @@ def _add_network_size_args(parser):
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
     group.add_argument('--position-embedding-type', type=str, default='learned_absolute',
-                        choices=['learned_absolute', 'rope', 'relative', 'none'],
+                        choices=['learned_absolute', 'rope', 'mrope', 'relative', 'none'],
                         help='Position embedding type.')
     group.add_argument('--relative-attention-num-buckets', type=int, default=32,
                         help='Number of buckets for relative position embeddings.')
@@ -1163,6 +1193,8 @@ def _add_network_size_args(parser):
                        action='store_false',
                        help='Disable position embedding. Deprecated: use --position-embedding-type',
                        dest='add_position_embedding')
+    group.add_argument('--mrope-section', nargs='+', type=int, default=None,
+                       help='Multimodal rope section is for channel dimension, empty by default.')
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Pad the vocab size to be divisible by this value.'
                        'This is added for computational efficieny reasons.')
@@ -1196,6 +1228,16 @@ def _add_network_size_args(parser):
                        help='Untie embeddings and output weights.')
     group.add_argument('--multi-latent-attention', action='store_true',
                        help='Use multi-latent attention for model.')
+    group.add_argument('--mtp-num-layers', type=int, default=None,
+                       help='Number of Multi-Token Prediction (MTP) Layers.'
+                       'MTP extends the prediction scope to multiple future tokens at each position.'
+                       'This MTP implementation sequentially predict additional tokens '
+                       'by using D sequential modules to predict D additional tokens.')                       
+    group.add_argument('--mtp-loss-scaling-factor', type=float, default=0.1,
+                       help='Scaling factor of Multi-Token Prediction (MTP) loss. '
+                       'We compute the average of the MTP losses across all depths, '
+                       'and multiply it the scaling factor to obtain the overall MTP loss, ' 
+                       'which serves as an additional training objective.')    
     return parser
 
 
