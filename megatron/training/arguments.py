@@ -363,8 +363,11 @@ def validate_args(args, defaults={}):
         if args.num_virtual_stages_per_pipeline_rank is None:
             assert args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None, \
                 'please use --num-virtual-stages-per-pipeline-rank to specify virtual pipeline parallel degree when enable uneven pipeline parallelism'
-            num_layers = args.num_layers
-
+            if args.num_layers is not None:
+                num_layers = args.num_layers
+            else:
+                num_layers = args.decoder_num_layers
+            
             if args.account_for_embedding_in_pipeline_split:
                 num_layers += 1
 
@@ -480,7 +483,7 @@ def validate_args(args, defaults={}):
         if args.data_parallel_sharding_strategy == "optim_grads_params":
             assert args.check_weight_hash_across_dp_replicas_interval is None, \
                 'check_weight_hash_across_dp_replicas_interval is not supported with optim_grads_params'
-        
+
         assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
             'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
 
@@ -939,6 +942,7 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
+    kw_args['fp8_param'] = args.fp8_param_gather
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -1232,12 +1236,12 @@ def _add_network_size_args(parser):
                        help='Number of Multi-Token Prediction (MTP) Layers.'
                        'MTP extends the prediction scope to multiple future tokens at each position.'
                        'This MTP implementation sequentially predict additional tokens '
-                       'by using D sequential modules to predict D additional tokens.')                       
+                       'by using D sequential modules to predict D additional tokens.')
     group.add_argument('--mtp-loss-scaling-factor', type=float, default=0.1,
                        help='Scaling factor of Multi-Token Prediction (MTP) loss. '
                        'We compute the average of the MTP losses across all depths, '
-                       'and multiply it the scaling factor to obtain the overall MTP loss, ' 
-                       'which serves as an additional training objective.')    
+                       'and multiply it the scaling factor to obtain the overall MTP loss, '
+                       'which serves as an additional training objective.')
     return parser
 
 
@@ -1456,8 +1460,8 @@ def _add_training_args(parser):
                        'with larger models, sequences, and batch sizes. '
                        'It is supported at two granularities 1) full: '
                        'whole transformer layer is recomputed, '
-                       '2) selective: core attention part of the transformer '
-                       'layer is recomputed.')
+                       '2) selective: submodules set in --recompute-modules '
+                       'are recomputed, default is core_attn.')
     group.add_argument('--no-check-for-nan-in-loss-and-grad', action='store_false',
                        help='Check for NaNs in loss and grad',
                        dest='check_for_nan_in_loss_and_grad')
@@ -1485,6 +1489,18 @@ def _add_training_args(parser):
                        'uniformly divided recompute unit, '
                        '2) block: the number of individual Transformer layers '
                        'to recompute within each pipeline stage.')
+    group.add_argument('--recompute-modules', nargs='*', type=str, default=None,
+                       help='The submodules to recompute. '
+                       'choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe". '
+                       'default: ["core_attn"].'
+                       '"core_attn": recompute the core attention part of the transformer layer. '
+                       '"moe_act": recompute the MoE MLP activation function. '
+                       '"layernorm": recompute the input_layernorm and pre_mlp_layernorm. '
+                       '"mla_up_proj": recompute the MLA up projection and RoPE applying parts.'
+                       '"mlp": recompute the dense MLP layer.'
+                       '"moe": recompute the MoE layer.'
+                       '"moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing, '
+                       '"core_attn", "mlp", and "moe" uses normal checkpointing.')
     group.add_argument('--no-clone-scatter-output-in-embedding', action='store_false',
                        help='If not set, clone the output of the scatter in embedding layer to GC original tensor.',
                        dest='clone_scatter_output_in_embedding')
@@ -1605,6 +1621,9 @@ def _add_training_args(parser):
     group.add_argument('--cross-entropy-loss-fusion', action='store_true',
                        help='Enabled fusion of cross entropy loss calculation.',
                        dest='cross_entropy_loss_fusion')
+    group.add_argument('--cross-entropy-fusion-impl', type=str, default='native',
+                       choices=['native', 'te'],
+                       help='Implementation of cross entropy loss calculation.')
     group.add_argument('--use-flash-attn', action='store_true',
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
@@ -1928,6 +1947,9 @@ def _add_mixed_precision_args(parser):
     group.add_argument('--fp16-lm-cross-entropy', action='store_true',
                        help='Move the cross entropy unreduced loss calculation'
                        'for lm head to fp16.')
+    group.add_argument('--disable-bf16-reduced-precision-matmul', action='store_true',
+                       help='If True, sets torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False to '
+                       'prevent matmul from using reduced precision accumulation when using BF16.')
 
     return parser
 
@@ -2388,13 +2410,23 @@ def _add_moe_args(parser):
                        'Only effective when moe-shared-expert-intermediate-size is set.')
     group.add_argument('--moe-grouped-gemm', action='store_true',
                        help='When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine.')
+    group.add_argument('--moe-use-legacy-grouped-gemm', action='store_true',
+                       help='Use legacy GroupedMLP rather than TEGroupedMLP. Note: The legacy one will be deprecated soon.')
+    group.add_argument('--moe-layer-recompute', action='store_true',
+                       help='Enable checkpointing for moe_layer, should be used when memory is not sufficient. '
+                       'Deprecated. Use "--recompute-granularity selective --recompute-modules moe" instead.')
+    group.add_argument('--moe-extended-tp', action='store_true',
+                       help='Deprecated. Use --expert-tensor-parallel-size instead.')
+    group.add_argument('--moe-use-upcycling', action='store_true',
+                       help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
+                       'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
     # Router arguments
     group.add_argument('--moe-router-load-balancing-type', type=str,
                        choices=['aux_loss', 'seq_aux_loss', 'sinkhorn', 'none'],
                        default='aux_loss',
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
-    group.add_argument('--moe-router-dtype', type=str, 
-                       choices=['fp32', 'fp64'], 
+    group.add_argument('--moe-router-dtype', type=str,
+                       choices=['fp32', 'fp64'],
                        default=None,
                        help='Data type for routing computation and expert output weighted averaging. '
                             'Fp32/fp64 enhances numerical stability, especially with numerous experts. '
@@ -2424,22 +2456,23 @@ def _add_moe_args(parser):
                        'The expert bias is updated based on the number of assigned tokens to each expert in a global batch, '
                        'where the bias is increased for the experts with less assigned tokens and decreased for the experts with more assigned tokens. '
                        'The default value 1e-3 is same as that used in DeepSeekV3.')
-    group.add_argument('--moe-use-legacy-grouped-gemm', action='store_true',
-                       help='Use legacy GroupedMLP rather than TEGroupedMLP. Note: The legacy one will be deprecated soon.')
     group.add_argument('--moe-aux-loss-coeff', type=float, default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
     group.add_argument('--moe-z-loss-coeff', type=float, default=None,
                        help='Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended.')
     group.add_argument('--moe-input-jitter-eps', type=float, default=None,
                        help='Add noise to the input tensor by applying jitter with a specified epsilon value.')
+    group.add_argument('--moe-per-layer-logging', action='store_true',
+                       help='Enable per-layer logging for MoE, currently supports auxiliary loss and z loss.')
+    # Token dispatcher arguments
     group.add_argument('--moe-token-dispatcher-type', type=str,
                        choices=['allgather', 'alltoall', 'flex', 'alltoall_seq'],
                        default='allgather',
                        help="The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather', 'alltoall' and 'alltoall_seq'. We recommend using 'alltoall' when applying expert parallelism. For more information, please refer to the documentation in core/moe/README.")
     group.add_argument('--moe-enable-deepep', action='store_true',
                        help='[Experimental] Enable DeepSeek/DeepEP for efficient token dispatching and combine in MoE models. Only works with flex token dispatcher by setting --moe-token-dispatcher-type=flex.')
-    group.add_argument('--moe-per-layer-logging', action='store_true',
-                       help='Enable per-layer logging for MoE, currently supports auxiliary loss and z loss.')
+    group.add_argument('--moe-permute-fusion', action='store_true',
+                       help='Fuse token rearrangement ops during token dispatching.')
     # Token dropping arguments
     group.add_argument('--moe-expert-capacity-factor', type=float, default=None,
                        help='The capacity factor for each expert, None means no token will be dropped.')
@@ -2447,15 +2480,6 @@ def _add_moe_args(parser):
                        help='Pads the input for each expert to match the expert capacity length, effective only after the --moe-expert-capacity-factor is set.')
     group.add_argument('--moe-token-drop-policy', type=str, default='probs', choices=['probs', 'position'],
                        help='The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.')
-    group.add_argument('--moe-layer-recompute', action='store_true',
-                       help='Enable checkpointing for moe_layer, should be used when memory is not sufficient.')
-    group.add_argument('--moe-extended-tp', action='store_true',
-                       help='Deprecated. Use --expert-tensor-parallel-size instead.')
-    group.add_argument('--moe-use-upcycling', action='store_true',
-                       help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
-                       'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
-    group.add_argument('--moe-permute-fusion', action='store_true',
-                       help='Fuse token rearrangement ops during token dispatching.')
 
     return parser
 
