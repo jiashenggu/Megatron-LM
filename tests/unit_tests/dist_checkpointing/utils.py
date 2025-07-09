@@ -114,8 +114,6 @@ def init_basic_mock_args(args, tp, pp, bf16=True):
     args.ddp_average_in_collective = False
     args.tensor_model_parallel_size = tp
     args.pipeline_model_parallel_size = pp
-    args.encoder_tensor_model_parallel_size = 0
-    args.encoder_pipeline_model_parallel_size = 0
     args.enable_ft_package = False
     args.use_torch_fsdp2 = False
     args.init_model_with_meta_device = False
@@ -175,6 +173,7 @@ def setup_model_and_optimizer(
                 tensor_model_parallel_size=tp,
                 pipeline_model_parallel_size=pp,
                 pipeline_dtype=torch.bfloat16,
+                bf16=bf16,
             )
         )
 
@@ -251,6 +250,7 @@ def setup_moe_model_and_optimizer(
                 use_te=use_te,
                 use_grouped_mlp=use_grouped_mlp,
                 use_glu=use_glu,
+                bf16=bf16,
             )
         )
 

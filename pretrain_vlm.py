@@ -1,31 +1,45 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain vision language model."""
+import warnings
 from copy import deepcopy
 from functools import partial
 import warnings
 
 import torch
 
-from megatron.core import parallel_state, tensor_parallel
-from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, MultimodalDatasetConfig
+from megatron.core import mpu, parallel_state, tensor_parallel
+from megatron.core.datasets.blended_megatron_dataset_builder import (
+    BlendedMegatronDatasetBuilder,
+)
+from megatron.core.datasets.multimodal_dataset import (
+    MockMultimodalDataset,
+    MultimodalDatasetConfig,
+)
 from megatron.core.enums import ModelType
-from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
-from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.models.multimodal.llava_model import LLaVAModel, DEFAULT_IMAGE_TOKEN_INDEX
-from megatron.core.models.multimodal.llava_spec import (
-    decoder_model_with_transformer_engine_default_spec,
-    decoder_model_with_local_default_spec,
-)
-from megatron.core.models.vision.vit_layer_specs import (
-    get_vit_layer_with_transformer_engine_spec,
-    get_vit_layer_with_local_spec,
-)
-from megatron.core.transformer.spec_utils import import_module
-from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core import mpu
 from megatron.core.models.multimodal import context_parallel
+from megatron.core.models.multimodal.llava_model import (
+    DEFAULT_IMAGE_TOKEN_INDEX,
+    LLaVAModel,
+)
+from megatron.core.models.multimodal.llava_spec import (
+    decoder_model_with_local_default_spec,
+    decoder_model_with_transformer_engine_default_spec,
+)
+from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
+from megatron.core.models.vision.vit_layer_specs import (
+    get_vit_layer_with_local_spec,
+    get_vit_layer_with_transformer_engine_spec,
+)
+from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.spec_utils import import_module
+from megatron.training import (
+    get_args,
+    get_timers,
+    get_tokenizer,
+    pretrain,
+    print_rank_0,
+)
+from megatron.training.arguments import core_transformer_config_from_args
 from pretrain_gpt import loss_func
 
 
@@ -54,6 +68,21 @@ def model_provider(
     assert args.ckpt_format == 'torch', "Only ckpt-format torch is supported for VLM training currently."
     assert not (args.context_parallel_size > 1 and args.pipeline_model_parallel_size > 1), "PP+CP is not yet supported by this script. \
     Current mock dataset does not support natively packed sequence dataset required for correct PP comm shapes."
+
+    # Deprecation warning for encoder pipeline parallelism
+    if args.encoder_pipeline_model_parallel_size > 0 or args.encoder_tensor_model_parallel_size > 0:
+        warnings.warn(
+            "Encoder-specific pipeline parallelism functionality is deprecated and will be removed in core_r0.14.0. "
+            "This includes the parameters 'encoder_tensor_model_parallel_size' and 'encoder_pipeline_model_parallel_size', "
+            "as well as all associated encoder pipeline parallel logic and infrastructure. "
+            "This functionality is being replaced by the new 'orthotope' parallelism management system, which provides "
+            "a more general and flexible approach to handling complex parallelism configurations including encoder-decoder models. "
+            "Please refrain from building new features or dependencies on encoder pipeline parallelism as this entire "
+            "capability will not be supported in future releases. For migration guidance and information on the orthotope "
+            "system, please refer to the Megatron-LM documentation.",
+            DeprecationWarning,
+            stacklevel=2
+        )
 
     num_image_embeddings = get_num_image_embeddings(
         args.img_h, args.img_w, args.patch_dim, vision_model_type, args.disable_vision_class_token,
@@ -235,6 +264,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         image_h=args.img_h,
         image_w=args.img_w,
         preprocess_func=_preprocess_data_for_llava,
+        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
     )
 
     print_rank_0("> building train, validation, and test datasets for multimodal ...")
